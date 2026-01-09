@@ -56,6 +56,7 @@ model User {
   wavesPicked       PickingWave[]        @relation("WavePickedBy")
   wavesShipped      PickingWave[]        @relation("WaveShippedBy")
   stockLogs         StockLog[]
+  refreshTokens     RefreshToken[]
   company           Company              @relation(fields: [companyId], references: [id], onDelete: Cascade)
 
   @@index([companyId])
@@ -599,6 +600,24 @@ model EmailVerification {
 
   @@index([email, code])
   @@map("email_verifications")
+}
+
+model RefreshToken {
+  id        String   @id @default(uuid())
+  jti       String   @unique // JWT ID - unique token identifier
+  userId    String
+  tokenHash String   // Hashed token for verification
+  expiresAt DateTime
+  revokedAt DateTime? // When token was revoked (null = active)
+  revokedBy String?   // IP or reason for revocation
+  createdAt DateTime  @default(now())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([jti])
+  @@index([expiresAt])
+  @@index([revokedAt])
+  @@map("refresh_tokens")
 }
 
 model SupportTicket {

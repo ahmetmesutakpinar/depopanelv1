@@ -139,22 +139,16 @@ class AuthController {
 
   /**
    * POST /api/auth/refresh
-   * Token yenileme
+   * Token yenileme - refresh token ile
    */
   refresh = asyncHandler(async (req: Request, res: Response) => {
-    const authHeader = req.headers.authorization;
+    const { refreshToken } = req.body;
     
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      throw new Error('Token gerekli');
+    if (!refreshToken) {
+      throw new Error('Refresh token gerekli');
     }
 
-    const token = authHeader.split(' ')[1];
-    
-    if (!token) {
-      throw new Error('Token gerekli');
-    }
-
-    const result = await authService.refreshToken(token);
+    const result = await authService.refreshToken(refreshToken);
     sendSuccess(res, 'Token yenilendi', result);
   });
 }
