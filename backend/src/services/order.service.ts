@@ -95,45 +95,49 @@ class OrderService {
       warehouseId = defaultWarehouse.id;
     }
 
-    // Validate products and calculate totals
-    let subtotal = 0;
-    const orderItems: any[] = [];
-
-    for (const item of input.items) {
-      const product = await productRepository.findByIdAndCompany(item.productId, companyId);
-      if (!product) {
-        throw new NotFoundError(`Ürün bulunamadı: ${item.productId}`);
-      }
-
-      // Check stock
-      const stock = await stockRepository.findStock(item.productId, warehouseId, item.variantId);
-      const availableQty = (stock?.quantity || 0) - (stock?.reservedQty || 0);
-
-      if (availableQty < item.quantity) {
-        throw new AppError(`Yetersiz stok: ${product.name}. Mevcut: ${availableQty}, Talep: ${item.quantity}`, 400);
-      }
-
-      const itemTotal = Number(product.price) * item.quantity;
-      subtotal += itemTotal;
-
-      orderItems.push({
-        productId: item.productId,
-        variantId: item.variantId,
-        sku: product.sku,
-        name: product.name,
-        quantity: item.quantity,
-        unitPrice: toNumber(product.price),
-        taxRate: toNumber(product.taxRate),
-        discount: 0,
-        total: itemTotal,
-      });
-    }
-
-    const taxAmount = subtotal * 0.20; // Default 20% KDV
-    const total = subtotal + taxAmount;
-
     // Create order with stock deduction (WooCommerce mantığı: sipariş oluşturulduğunda stok düşer)
     const order = await prisma.$transaction(async (tx) => {
+      // Validate products and calculate totals INSIDE the transaction
+      let subtotal = 0;
+      const orderItemsData: any[] = [];
+
+      for (const item of input.items) {
+        const product = await tx.product.findFirst({
+          where: { id: item.productId, companyId: companyId }
+        });
+        if (!product) {
+          throw new NotFoundError(`Ürün bulunamadı: ${item.productId}`);
+        }
+
+        // Check stock INSIDE the transaction for consistency
+        const stock = await tx.stock.findFirst({
+            where: { productId: item.productId, warehouseId: warehouseId, variantId: item.variantId }
+        });
+        const availableQty = (stock?.quantity || 0) - (stock?.reservedQty || 0);
+
+        if (availableQty < item.quantity) {
+          throw new AppError(`Yetersiz stok: ${product.name}. Mevcut: ${availableQty}, Talep: ${item.quantity}`, 400);
+        }
+
+        const itemTotal = Number(product.price) * item.quantity;
+        subtotal += itemTotal;
+
+        orderItemsData.push({
+          productId: item.productId,
+          variantId: item.variantId,
+          sku: product.sku,
+          name: product.name,
+          quantity: item.quantity,
+          unitPrice: toNumber(product.price),
+          taxRate: toNumber(product.taxRate),
+          discount: 0,
+          total: itemTotal,
+        });
+      }
+
+      const taxAmount = subtotal * 0.20; // Default 20% KDV
+      const total = subtotal + taxAmount;
+
       // Create order
       const newOrder = await tx.order.create({
         data: {
@@ -157,7 +161,7 @@ class OrderService {
           companyId,
           createdById: userId,
           items: {
-            create: orderItems,
+            create: orderItemsData,
           },
         },
         include: {
