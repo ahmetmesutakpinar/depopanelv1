@@ -453,8 +453,8 @@ class AuthService {
       } catch (error: any) {
         // Token expired veya invalid
         if (error instanceof jwt.TokenExpiredError) {
-          // Expired token'ı decode et (ignoreExpiration ile)
-          decoded = jwt.decode(token) as JwtPayload;
+          // Expired token's signature MUST be verified. This is the fix.
+          decoded = jwt.verify(token, env.JWT_SECRET, { ignoreExpiration: true }) as JwtPayload;
           if (!decoded || !decoded.userId) {
             throw new UnauthorizedError('Geçersiz token');
           }
