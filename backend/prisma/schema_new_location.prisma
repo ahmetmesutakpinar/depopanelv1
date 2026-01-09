@@ -1,0 +1,240 @@
+// Yeni Location-Stock Sistemi için Prisma Schema
+// Bu dosya yeni tasarımı gösterir, mevcut schema.prisma'ya entegre edilecek
+
+// ============================================
+// Location Model (Warehouse + Location birleşik)
+// ============================================
+
+model Location {
+  id                 String                      @id @default(uuid())
+  code               String                      // Örn: "MAGAZA-01", "DEPO-MERKEZ"
+  name               String                      // Örn: "Kadıköy Mağazası", "İstim Merkez Depo"
+  type               LocationType                @default(WAREHOUSE)
+  
+  // Adres bilgileri
+  address            String?
+  city               String?
+  phone              String?
+  
+  // Durum bilgileri
+  isDefault          Boolean                     @default(false)
+  isActive           Boolean                     @default(true)
+  capacity           Int?                        // Kapasite (opsiyonel)
+  notes              String?
+  
+  // Detaylı lokasyon bilgisi (raf sistemi - opsiyonel)
+  zone               String?                     // Bölge
+  aisle              String?                     // Koridor
+  shelf              String?                     // Raf
+  bin                String?                     // Kutu
+  
+  // İlişkiler
+  companyId          String
+  createdAt          DateTime                    @default(now())
+  updatedAt          DateTime                    @updatedAt
+  
+  // Relations
+  company            Company                     @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  stocks             Stock[]
+  campaignStocks     CampaignStock[]
+  countItems         InventoryCountItem[]
+  inventoryCounts    InventoryCount[]
+  productAssignments ProductLocationAssignment[]
+  setStocks          SetStock[]
+  stockLogs          StockLog[]
+  ordersFrom         Order[]                     @relation("OrderFromLocation")
+  pickingWaves       PickingWave[]
+  transfersFrom      Transfer[]                  @relation("TransferFrom")
+  transfersTo        Transfer[]                  @relation("TransferTo")
+
+  @@unique([companyId, code])
+  @@index([companyId])
+  @@index([type])
+  @@index([isActive])
+  @@index([isDefault])
+  @@map("locations")
+}
+
+enum LocationType {
+  STORE       // Mağaza
+  WAREHOUSE   // Ana Depo
+  STORAGE     // Depolama Alanı
+  PRODUCTION  // Üretim Alanı
+  TRANSIT     // Transit/Geçiş
+  SHARED      // Paylaşımlı (backward compatibility)
+}
+
+// ============================================
+// Stock Model (Güncellendi)
+// ============================================
+
+model Stock {
+  id          String          @id @default(uuid())
+  quantity    Int             @default(0)
+  reservedQty Int             @default(0)
+  minQuantity Int             @default(0)
+  productId   String
+  variantId   String?
+  locationId  String          // warehouse_id yerine location_id
+  createdAt   DateTime        @default(now())
+  updatedAt   DateTime        @updatedAt
+  
+  location    Location        @relation(fields: [locationId], references: [id], onDelete: Cascade)
+  product     Product         @relation(fields: [productId], references: [id], onDelete: Cascade)
+  variant     ProductVariant? @relation(fields: [variantId], references: [id], onDelete: Cascade)
+
+  @@unique([productId, variantId, locationId])
+  @@index([productId, locationId])
+  @@index([locationId])
+  @@index([quantity])
+  @@map("stocks")
+}
+
+// ============================================
+// StockLog Model (Güncellendi)
+// ============================================
+
+model StockLog {
+  id          String          @id @default(uuid())
+  type        StockLogType
+  quantity    Int
+  previousQty Int
+  newQty      Int
+  note        String?
+  reference   String?         // Sipariş no, transfer no, sayım no, vb.
+  productId   String
+  variantId   String?
+  locationId  String          // warehouse_id yerine location_id
+  userId      String?
+  createdAt   DateTime        @default(now())
+  components  Json?
+  setSku      String?
+  
+  location    Location        @relation(fields: [locationId], references: [id], onDelete: Cascade)
+  product     Product         @relation(fields: [productId], references: [id], onDelete: Cascade)
+  user        User?           @relation(fields: [userId], references: [id], onDelete: SetNull)
+  variant     ProductVariant? @relation(fields: [variantId], references: [id], onDelete: Cascade)
+
+  @@index([productId])
+  @@index([locationId])
+  @@index([type])
+  @@index([createdAt])
+  @@index([userId])
+  @@index([setSku])
+  @@map("stock_logs")
+}
+
+enum StockLogType {
+  IN          // Stok Girişi
+  OUT         // Stok Çıkışı
+  ADJUSTMENT  // Düzeltme
+  TRANSFER    // Transfer
+  COUNT       // Sayım
+  RETURN      // İade
+}
+
+// ============================================
+// Transfer Model (Güncellendi)
+// ============================================
+
+model Transfer {
+  id             String          @id @default(uuid())
+  transferNumber String          @unique
+  fromLocationId String          // from_warehouse_id yerine
+  toLocationId   String          // to_warehouse_id yerine
+  status         TransferStatus  @default(PENDING)
+  notes          String?
+  companyId      String
+  createdById    String
+  approvedById   String?
+  completedById  String?
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+  approvedAt     DateTime?
+  completedAt    DateTime?
+  items          TransferItem[]
+  fromLocation   Location        @relation("TransferFrom", fields: [fromLocationId], references: [id])
+  toLocation     Location        @relation("TransferTo", fields: [toLocationId], references: [id])
+
+  @@index([companyId])
+  @@index([status])
+  @@index([fromLocationId])
+  @@index([toLocationId])
+  @@index([createdAt])
+  @@map("transfers")
+}
+
+// ============================================
+// Order Model (Güncellendi)
+// ============================================
+
+model Order {
+  // ... (diğer alanlar aynı)
+  locationId         String?         // warehouse_id yerine
+  location           Location?       @relation("OrderFromLocation", fields: [locationId], references: [id])
+  // ...
+}
+
+// ============================================
+// PickingWave Model (Güncellendi)
+// ============================================
+
+model PickingWave {
+  // ... (diğer alanlar aynı)
+  locationId    String          // warehouse_id yerine
+  location      Location        @relation(fields: [locationId], references: [id])
+  // ...
+}
+
+// ============================================
+// InventoryCount Model (Güncellendi)
+// ============================================
+
+model InventoryCount {
+  // ... (diğer alanlar aynı)
+  locationId    String?         // warehouse_id yerine
+  location      Location?       @relation(fields: [locationId], references: [id])
+  // ...
+}
+
+// ============================================
+// CampaignStock Model (Güncellendi)
+// ============================================
+
+model CampaignStock {
+  id            String      @id @default(uuid())
+  campaignSetId String
+  locationId    String      // warehouse_id kaldırıldı, sadece location_id
+  quantity      Int         @default(0)
+  reservedQty   Int         @default(0)
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+  campaignSet   CampaignSet @relation(fields: [campaignSetId], references: [id], onDelete: Cascade)
+  location      Location    @relation(fields: [locationId], references: [id], onDelete: Cascade)
+
+  @@unique([campaignSetId, locationId])
+  @@index([campaignSetId])
+  @@index([locationId])
+  @@map("campaign_stocks")
+}
+
+// ============================================
+// SetStock Model (Güncellendi)
+// ============================================
+
+model SetStock {
+  id          String   @id @default(uuid())
+  setProductId String
+  locationId  String   // warehouse_id kaldırıldı, sadece location_id
+  quantity    Int      @default(0)
+  reservedQty Int      @default(0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  location    Location @relation(fields: [locationId], references: [id], onDelete: Cascade)
+  setProduct  Product  @relation(fields: [setProductId], references: [id], onDelete: Cascade)
+
+  @@unique([setProductId, locationId])
+  @@index([setProductId])
+  @@index([locationId])
+  @@map("set_stocks")
+}

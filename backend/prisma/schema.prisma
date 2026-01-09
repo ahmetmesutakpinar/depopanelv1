@@ -1,0 +1,1109 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Company {
+  id              String                   @id @default(uuid())
+  name            String
+  email           String                   @unique
+  phone           String?
+  address         String?
+  taxNumber       String?
+  status          CompanyStatus            @default(PENDING)
+  createdAt       DateTime                 @default(now())
+  updatedAt       DateTime                 @updatedAt
+  bulkOperations  BulkOperation[]
+  campaignSets    CampaignSet[]
+  cargoCompanies  CargoCompany[]
+  categories      Category[]
+  inventoryCounts InventoryCount[]
+  integrations    MarketplaceIntegration[]
+  orders          Order[]
+  pickingWaves    PickingWave[]
+  products        Product[]
+  users           User[]
+  warehouses      Warehouse[]
+
+  @@index([status])
+  @@index([createdAt])
+  @@map("companies")
+}
+
+model User {
+  id                String               @id @default(uuid())
+  email             String               @unique
+  password          String
+  firstName         String
+  lastName          String
+  phone             String?
+  role              UserRole             @default(STAFF)
+  isActive          Boolean              @default(true)
+  companyId         String
+  createdAt         DateTime             @default(now())
+  updatedAt         DateTime             @updatedAt
+  emailVerified     Boolean              @default(false)
+  permissions       Json?
+  countItemsCounted InventoryCountItem[] @relation("CountItemCountedBy")
+  countsApproved    InventoryCount[]     @relation("CountApprovedBy")
+  countsCreated     InventoryCount[]     @relation("CountCreatedBy")
+  orders            Order[]              @relation("OrderCreatedBy")
+  wavesAssigned     PickingWave[]        @relation("WaveAssignedTo")
+  wavesPicked       PickingWave[]        @relation("WavePickedBy")
+  wavesShipped      PickingWave[]        @relation("WaveShippedBy")
+  stockLogs         StockLog[]
+  company           Company              @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@index([companyId])
+  @@index([email])
+  @@index([role])
+  @@index([isActive])
+  @@map("users")
+}
+
+model Warehouse {
+  id              String           @id @default(uuid())
+  name            String
+  code            String
+  address         String?
+  city            String?
+  isDefault       Boolean          @default(false)
+  isActive        Boolean          @default(true)
+  companyId       String
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+  campaignStocks  CampaignStock[]
+  inventoryCounts InventoryCount[]
+  locations       Location[]
+  ordersFrom      Order[]          @relation("OrderFromWarehouse")
+  pickingWaves    PickingWave[]
+  setStocks       SetStock[]
+  stockLogs       StockLog[]
+  stocks          Stock[]
+  transfersFrom   Transfer[]       @relation("TransferFrom")
+  transfersTo     Transfer[]       @relation("TransferTo")
+  company         Company          @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@unique([companyId, code])
+  @@index([companyId])
+  @@index([isActive])
+  @@index([isDefault])
+  @@map("warehouses")
+}
+
+model Location {
+  id                 String                      @id @default(uuid())
+  code               String
+  name               String?
+  zone               String?
+  aisle              String?
+  shelf              String?
+  bin                String?
+  warehouseId        String
+  isActive           Boolean                     @default(true)
+  capacity           Int?
+  notes              String?
+  createdAt          DateTime                    @default(now())
+  updatedAt          DateTime                    @updatedAt
+  locationType       LocationType                @default(SHARED)
+  campaignStocks     CampaignStock[]
+  countItems         InventoryCountItem[]
+  inventoryCounts    InventoryCount[]
+  warehouse          Warehouse                   @relation(fields: [warehouseId], references: [id], onDelete: Cascade)
+  productAssignments ProductLocationAssignment[]
+  setStocks          SetStock[]
+  stocks             Stock[]
+
+  @@unique([warehouseId, code])
+  @@index([isActive])
+  @@index([warehouseId])
+  @@map("locations")
+}
+
+model ProductLocationAssignment {
+  id         String          @id @default(uuid())
+  productId  String
+  variantId  String?
+  locationId String
+  isPrimary  Boolean         @default(true)
+  createdAt  DateTime        @default(now())
+  updatedAt  DateTime        @updatedAt
+  location   Location        @relation(fields: [locationId], references: [id], onDelete: Cascade)
+  product    Product         @relation(fields: [productId], references: [id], onDelete: Cascade)
+  variant    ProductVariant? @relation(fields: [variantId], references: [id], onDelete: Cascade)
+
+  @@unique([productId, variantId, locationId])
+  @@map("product_location_assignments")
+}
+
+model Category {
+  id        String     @id @default(uuid())
+  name      String
+  slug      String
+  parentId  String?
+  companyId String
+  createdAt DateTime   @default(now())
+  updatedAt DateTime   @updatedAt
+  company   Company    @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  parent    Category?  @relation("CategoryHierarchy", fields: [parentId], references: [id])
+  children  Category[] @relation("CategoryHierarchy")
+  products  Product[]
+
+  @@unique([companyId, slug])
+  @@index([companyId])
+  @@index([parentId])
+  @@map("categories")
+}
+
+model Product {
+  id                  String                      @id @default(uuid())
+  sku                 String
+  // BARCODE IDENTITY: Barcode is PRIMARY identity for products
+  // NULL barcodes are allowed (products without barcode)
+  // TODO: Add unique constraint after checking for duplicates:
+  //   Run: SELECT "companyId", "barcode", COUNT(*) FROM products WHERE "barcode" IS NOT NULL GROUP BY "companyId", "barcode" HAVING COUNT(*) > 1;
+  //   If duplicates exist, resolve them before adding constraint
+  //   Constraint: @@unique([companyId, barcode]) WHERE barcode IS NOT NULL (requires partial unique index in migration)
+  barcode             String?
+  name                String
+  description         String?
+  brand               String?
+  price               Decimal                     @db.Decimal(10, 2)
+  costPrice           Decimal?                    @db.Decimal(10, 2)
+  taxRate             Decimal                     @default(20) @db.Decimal(5, 2)
+  weight              Decimal?                    @db.Decimal(10, 3)
+  width               Decimal?                    @db.Decimal(10, 2)
+  height              Decimal?                    @db.Decimal(10, 2)
+  depth               Decimal?                    @db.Decimal(10, 2)
+  imageUrl            String?
+  isActive            Boolean                     @default(true)
+  categoryId          String?
+  companyId           String
+  wooCommerceId       Int?
+  createdAt           DateTime                    @default(now())
+  updatedAt           DateTime                    @updatedAt
+  gtin                String?
+  isCampaignProduct   Boolean                     @default(false)
+  type                ProductType                 @default(PRODUCT)
+  campaignSetId       String?
+  minQuantity         Int                         @default(0)
+  // MERGE TRACKING: Fields for duplicate product merge operations
+  mergedIntoProductId String?                    // Points to master product if this product was merged
+  mergedAt            DateTime?                   // When merge occurred
+  mergedBy            String?                     // User who performed merge (optional)
+  // REVERT TRACKING: Fields for merge revert operations
+  mergeRevertedAt     DateTime?                   // When merge was reverted
+  mergeRevertedBy     String?                     // User who reverted merge (optional)
+  mergeRevertReason   String?                     // Reason for revert
+  campaignSetItems    CampaignSetItem[]
+  countItems          InventoryCountItem[]
+  marketplaceProducts MarketplaceProduct[]
+  orderItems          OrderItem[]
+  locationAssignments ProductLocationAssignment[]
+  componentSetItems   ProductSetItem[]            @relation("ComponentProduct")
+  setItems            ProductSetItem[]            @relation("SetProduct")
+  productSources      ProductSource[]
+  variants            ProductVariant[]
+  campaignSet         CampaignSet?                @relation(fields: [campaignSetId], references: [id])
+  category            Category?                   @relation(fields: [categoryId], references: [id])
+  company             Company                     @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  setStocks           SetStock[]
+  stockLogs           StockLog[]
+  stocks              Stock[]
+
+  @@unique([companyId, sku])
+  @@index([companyId])
+  @@index([companyId, sku])
+  @@index([companyId, isActive])
+  @@index([companyId, type])
+  @@index([barcode])
+  @@index([gtin])
+  // TODO: Add barcode uniqueness constraint after duplicate resolution:
+  //   This requires a partial unique index in PostgreSQL:
+  //   CREATE UNIQUE INDEX products_company_barcode_unique ON products(companyId, barcode) WHERE barcode IS NOT NULL;
+  //   Prisma doesn't support partial unique constraints directly, so this must be added in a raw SQL migration
+  @@index([isActive])
+  @@index([categoryId])
+  @@index([type])
+  @@index([wooCommerceId])
+  @@index([campaignSetId])
+  @@map("products")
+}
+
+model ProductVariant {
+  id                  String                      @id @default(uuid())
+  productId           String
+  sku                 String
+  barcode             String?
+  name                String
+  attributes          Json
+  price               Decimal?                    @db.Decimal(10, 2)
+  imageUrl            String?
+  isActive            Boolean                     @default(true)
+  createdAt           DateTime                    @default(now())
+  updatedAt           DateTime                    @updatedAt
+  campaignSetItems    CampaignSetItem[]
+  countItems          InventoryCountItem[]
+  orderItems          OrderItem[]
+  locationAssignments ProductLocationAssignment[]
+  product             Product                     @relation(fields: [productId], references: [id], onDelete: Cascade)
+  stockLogs           StockLog[]
+  stocks              Stock[]
+
+  @@unique([productId, sku])
+  @@index([productId])
+  @@index([isActive])
+  @@index([barcode])
+  @@map("product_variants")
+}
+
+model Stock {
+  id          String          @id @default(uuid())
+  // DEPRECATED: quantity is no longer the source of truth
+  // Stock quantity should be calculated from StockLog movements:
+  //   Stock = SUM(IN movements) - SUM(OUT movements)
+  //   IN types: IN, RETURN, RETURN_SET_READY, RETURN_SET_COMPONENT, PACKING_IN
+  //   OUT types: OUT, OUT_SET_READY, OUT_SET_COMPONENT, TRANSFER
+  // This field is kept for backward compatibility and will be removed in future migration
+  // DO NOT update this field directly - use StockLog entries instead
+  quantity    Int             @default(0)
+  reservedQty Int             @default(0)
+  minQuantity Int             @default(0)
+  productId   String
+  variantId   String?
+  warehouseId String
+  createdAt   DateTime        @default(now())
+  updatedAt   DateTime        @updatedAt
+  locationId  String?
+  location    Location?       @relation(fields: [locationId], references: [id])
+  product     Product         @relation(fields: [productId], references: [id], onDelete: Cascade)
+  variant     ProductVariant? @relation(fields: [variantId], references: [id], onDelete: Cascade)
+  warehouse   Warehouse       @relation(fields: [warehouseId], references: [id], onDelete: Cascade)
+
+  @@unique([productId, variantId, warehouseId, locationId])
+  @@index([productId, warehouseId])
+  @@index([productId, variantId])
+  @@index([warehouseId, locationId])
+  @@index([warehouseId])
+  @@index([locationId])
+  @@index([quantity])
+  @@map("stocks")
+}
+
+model StockLog {
+  id          String          @id @default(uuid())
+  type        StockLogType
+  quantity    Int
+  previousQty Int
+  newQty      Int
+  note        String?
+  reference   String?
+  productId   String
+  variantId   String?
+  warehouseId String
+  userId      String?
+  createdAt   DateTime        @default(now())
+  components  Json?
+  setSku      String?
+  product     Product         @relation(fields: [productId], references: [id], onDelete: Cascade)
+  user        User?           @relation(fields: [userId], references: [id])
+  variant     ProductVariant? @relation(fields: [variantId], references: [id], onDelete: Cascade)
+  warehouse   Warehouse       @relation(fields: [warehouseId], references: [id], onDelete: Cascade)
+
+  @@index([productId])
+  @@index([warehouseId])
+  @@index([type])
+  @@index([createdAt])
+  @@index([userId])
+  @@index([setSku])
+  @@map("stock_logs")
+}
+
+model MarketplaceIntegration {
+  id             String               @id @default(uuid())
+  type           MarketplaceType
+  name           String
+  apiUrl         String?
+  apiKey         String?
+  apiSecret      String?
+  sellerId       String?
+  accessToken    String?
+  refreshToken   String?
+  tokenExpiry    DateTime?
+  settings       Json?
+  status         IntegrationStatus    @default(INACTIVE)
+  lastSyncAt     DateTime?
+  companyId      String
+  createdAt      DateTime             @default(now())
+  updatedAt      DateTime             @updatedAt
+  isActive       Boolean              @default(true)
+  company        Company              @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  products       MarketplaceProduct[]
+  orderSources   OrderSource[]
+  orders         Order[]
+  productSources ProductSource[]
+
+  @@unique([companyId, type])
+  @@index([companyId])
+  @@index([status])
+  @@index([type])
+  @@index([isActive])
+  @@map("marketplace_integrations")
+}
+
+model MarketplaceProduct {
+  id            String                 @id @default(uuid())
+  marketplaceId String
+  productId     String
+  integrationId String
+  price         Decimal?               @db.Decimal(10, 2)
+  listingUrl    String?
+  isActive      Boolean                @default(true)
+  lastSyncAt    DateTime?
+  syncError     String?
+  createdAt     DateTime               @default(now())
+  updatedAt     DateTime               @updatedAt
+  integration   MarketplaceIntegration @relation(fields: [integrationId], references: [id], onDelete: Cascade)
+  product       Product                @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@unique([integrationId, marketplaceId])
+  @@index([productId])
+  @@index([integrationId])
+  @@index([isActive])
+  @@map("marketplace_products")
+}
+
+model ProductSource {
+  id                String                 @id @default(cuid())
+  productId         String
+  integrationId     String
+  externalProductId String
+  externalSku       String?
+  externalBarcode   String?
+  externalPrice     Decimal?               @db.Decimal(10, 2)
+  lastSyncAt        DateTime               @default(now())
+  createdAt         DateTime               @default(now())
+  updatedAt         DateTime               @updatedAt
+  integration       MarketplaceIntegration @relation(fields: [integrationId], references: [id], onDelete: Cascade)
+  product           Product                @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@unique([productId, integrationId])
+  @@index([integrationId, externalProductId])
+  @@index([productId])
+  @@index([integrationId])
+  @@map("product_sources")
+}
+
+model OrderSource {
+  id                  String                 @id @default(cuid())
+  orderId             String
+  integrationId       String
+  externalOrderId     String
+  externalStatus      String?
+  externalCustomerId  String?
+  shippingProvider    String?
+  shippingBarcode     String?
+  shippingTrackingUrl String?
+  lastSyncAt          DateTime               @default(now())
+  createdAt           DateTime               @default(now())
+  updatedAt           DateTime               @updatedAt
+  integration         MarketplaceIntegration @relation(fields: [integrationId], references: [id], onDelete: Cascade)
+  order               Order                  @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@unique([orderId, integrationId])
+  @@index([integrationId, externalOrderId])
+  @@index([orderId])
+  @@index([integrationId])
+  @@index([shippingBarcode])
+  @@map("order_sources")
+}
+
+model Order {
+  id                     String                  @id @default(uuid())
+  orderNumber            String
+  marketplaceOrderId     String?
+  status                 OrderStatus             @default(PENDING)
+  customerName           String
+  customerEmail          String?
+  customerPhone          String?
+  shippingAddress        String
+  shippingCity           String?
+  shippingDistrict       String?
+  shippingPostalCode     String?
+  shippingCountry        String                  @default("Türkiye")
+  billingAddress         String?
+  billingCity            String?
+  billingDistrict        String?
+  billingPostalCode      String?
+  subtotal               Decimal                 @db.Decimal(10, 2)
+  taxAmount              Decimal                 @default(0) @db.Decimal(10, 2)
+  shippingCost           Decimal                 @default(0) @db.Decimal(10, 2)
+  discount               Decimal                 @default(0) @db.Decimal(10, 2)
+  total                  Decimal                 @db.Decimal(10, 2)
+  trackingNumber         String?
+  shippedAt              DateTime?
+  deliveredAt            DateTime?
+  customerNote           String?
+  internalNote           String?
+  integrationId          String?
+  warehouseId            String?
+  companyId              String
+  createdById            String?
+  createdAt              DateTime                @default(now())
+  updatedAt              DateTime                @updatedAt
+  cargoCompanyId         String?
+  pickingWaveId          String?
+  externalShipmentId     String?
+  externalTrackingNumber String?
+  shippingProvider       String?
+  items                  OrderItem[]
+  orderSources           OrderSource[]
+  cargoCompany           CargoCompany?           @relation(fields: [cargoCompanyId], references: [id])
+  company                Company                 @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  createdBy              User?                   @relation("OrderCreatedBy", fields: [createdById], references: [id])
+  integration            MarketplaceIntegration? @relation(fields: [integrationId], references: [id])
+  pickingWave            PickingWave?            @relation(fields: [pickingWaveId], references: [id])
+  warehouse              Warehouse?              @relation("OrderFromWarehouse", fields: [warehouseId], references: [id], onDelete: Restrict)
+  returns                Return[]
+
+  @@unique([companyId, orderNumber])
+  @@index([companyId])
+  @@index([companyId, status])
+  @@index([companyId, createdAt])
+  @@index([companyId, integrationId])
+  @@index([status])
+  @@index([integrationId])
+  @@index([warehouseId])
+  @@index([pickingWaveId])
+  @@index([createdAt])
+  @@index([marketplaceOrderId])
+  @@map("orders")
+}
+
+model OrderItem {
+  id          String          @id @default(uuid())
+  orderId     String
+  // UNRESOLVED PRODUCT SUPPORT: productId is nullable to support unresolved products
+  // When productId is NULL, the item represents an unresolved product from order import
+  // The sku, name fields below preserve the original identifiers for later resolution
+  productId   String?
+  variantId   String?
+  // PRESERVED IDENTIFIERS: When productId is NULL, these fields preserve original order data
+  // - sku: Original SKU from order (used for unresolved product tracking)
+  // - name: Original product name from order (used for unresolved product tracking)
+  // Note: unresolvedBarcode is not stored here as OrderItem doesn't have barcode field
+  // If barcode tracking is needed for unresolved products, consider adding unresolvedBarcode field
+  sku         String
+  name        String
+  quantity    Int
+  unitPrice   Decimal         @db.Decimal(10, 2)
+  taxRate     Decimal         @default(20) @db.Decimal(5, 2)
+  discount    Decimal         @default(0) @db.Decimal(10, 2)
+  total       Decimal         @db.Decimal(10, 2)
+  createdAt   DateTime        @default(now())
+  order       Order           @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  product     Product?        @relation(fields: [productId], references: [id])
+  variant     ProductVariant? @relation(fields: [variantId], references: [id])
+  returnItems ReturnItem[]
+
+  @@index([orderId])
+  @@index([orderId, productId])
+  @@index([productId])
+  @@index([sku])
+  @@map("order_items")
+}
+
+model Return {
+  id           String       @id @default(uuid())
+  returnNumber String
+  orderId      String
+  reason       String
+  status       String       @default("PENDING")
+  note         String?
+  refundAmount Decimal?     @db.Decimal(10, 2)
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
+  items        ReturnItem[]
+  order        Order        @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([orderId])
+  @@index([status])
+  @@index([createdAt])
+  @@map("returns")
+}
+
+model ReturnItem {
+  id          String    @id @default(uuid())
+  returnId    String
+  orderItemId String
+  quantity    Int
+  reason      String?
+  createdAt   DateTime  @default(now())
+  orderItem   OrderItem @relation(fields: [orderItemId], references: [id])
+  return      Return    @relation(fields: [returnId], references: [id], onDelete: Cascade)
+
+  @@index([returnId])
+  @@index([orderItemId])
+  @@map("return_items")
+}
+
+model SyncLog {
+  id               String          @id @default(uuid())
+  type             String
+  marketplace      MarketplaceType
+  status           String
+  message          String?
+  details          Json?
+  recordsProcessed Int             @default(0)
+  recordsFailed    Int             @default(0)
+  companyId        String
+  createdAt        DateTime        @default(now())
+  error            String?
+  metadata         Json?
+
+  @@index([companyId])
+  @@index([companyId, type])
+  @@index([companyId, type, createdAt])
+  @@index([companyId, status])
+  @@index([type])
+  @@index([status])
+  @@index([marketplace])
+  @@index([createdAt])
+  @@map("sync_logs")
+}
+
+model Setting {
+  id        String   @id @default(uuid())
+  key       String
+  value     String
+  companyId String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([key, companyId])
+  @@map("settings")
+}
+
+model EmailVerification {
+  id        String   @id @default(uuid())
+  email     String
+  code      String
+  type      String   @default("REGISTER")
+  expiresAt DateTime
+  verified  Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  @@index([email, code])
+  @@map("email_verifications")
+}
+
+model SupportTicket {
+  id          String   @id @default(uuid())
+  type        String
+  subject     String
+  message     String
+  status      String   @default("OPEN")
+  email       String
+  companyId   String?
+  companyName String?
+  response    String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@map("support_tickets")
+}
+
+model InventoryCount {
+  id           String               @id @default(uuid())
+  code         String
+  warehouseId  String
+  locationId   String?
+  status       CountingStatus       @default(PENDING)
+  type         String
+  notes        String?
+  startedAt    DateTime?
+  completedAt  DateTime?
+  approvedAt   DateTime?
+  approvedById String?
+  companyId    String
+  createdById  String
+  createdAt    DateTime             @default(now())
+  updatedAt    DateTime             @updatedAt
+  items        InventoryCountItem[]
+  approvedBy   User?                @relation("CountApprovedBy", fields: [approvedById], references: [id])
+  company      Company              @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  createdBy    User                 @relation("CountCreatedBy", fields: [createdById], references: [id])
+  location     Location?            @relation(fields: [locationId], references: [id], onDelete: Cascade)
+  warehouse    Warehouse            @relation(fields: [warehouseId], references: [id], onDelete: Cascade)
+
+  @@unique([companyId, code])
+  @@index([companyId])
+  @@index([companyId, status])
+  @@index([companyId, warehouseId])
+  @@index([companyId, type])
+  @@index([warehouseId])
+  @@index([status])
+  @@index([type])
+  @@index([createdAt])
+  @@map("inventory_counts")
+}
+
+model InventoryCountItem {
+  id          String          @id @default(uuid())
+  countId     String
+  productId   String
+  variantId   String?
+  locationId  String?
+  systemQty   Int
+  countedQty  Int
+  difference  Int
+  notes       String?
+  countedAt   DateTime?
+  countedById String?
+  createdAt   DateTime        @default(now())
+  updatedAt   DateTime        @updatedAt
+  targetQty   Int?
+  count       InventoryCount  @relation(fields: [countId], references: [id], onDelete: Cascade)
+  countedBy   User?           @relation("CountItemCountedBy", fields: [countedById], references: [id])
+  location    Location?       @relation(fields: [locationId], references: [id])
+  product     Product         @relation(fields: [productId], references: [id])
+  variant     ProductVariant? @relation(fields: [variantId], references: [id])
+
+  @@unique([countId, productId, variantId, locationId])
+  @@index([countId])
+  @@index([countId, productId])
+  @@index([productId])
+  @@index([locationId])
+  @@map("inventory_count_items")
+}
+
+model PickingWave {
+  id             String          @id @default(uuid())
+  code           String
+  warehouseId    String
+  strategy       PickingStrategy @default(SINGLE_ORDER)
+  type           WaveType        @default(MANUAL)
+  status         WaveStatus      @default(CREATED)
+  priority       Int             @default(0)
+  assignedToId   String?
+  startedAt      DateTime?
+  completedAt    DateTime?
+  closedAt       DateTime?
+  companyId      String
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+  pickedAt       DateTime?
+  pickedById     String?
+  shippedAt      DateTime?
+  shippedById    String?
+  pickedItems    Json?
+  creationReason String? // Rule-based description of why wave was created
+  totalOrders    Int             @default(0)
+  totalItems     Int             @default(0)
+  hasStockIssue  Boolean         @default(false) // Flag for stock exceptions
+  stockIssueNote String? // Details about stock issues
+  createdBy      String? // 'system' or userId for manual waves
+  rules          Json? // Store the rules that created this wave
+  cutOffTime     DateTime? // For time-based waves
+  orders         Order[]
+  assignedTo     User?           @relation("WaveAssignedTo", fields: [assignedToId], references: [id])
+  company        Company         @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  pickedBy       User?           @relation("WavePickedBy", fields: [pickedById], references: [id])
+  shippedBy      User?           @relation("WaveShippedBy", fields: [shippedById], references: [id])
+  warehouse      Warehouse       @relation(fields: [warehouseId], references: [id], onDelete: Cascade)
+
+  @@unique([companyId, code])
+  @@index([companyId])
+  @@index([companyId, status])
+  @@index([companyId, warehouseId])
+  @@index([companyId, type])
+  @@index([warehouseId])
+  @@index([status])
+  @@index([type])
+  @@index([assignedToId])
+  @@index([pickedById])
+  @@index([shippedById])
+  @@index([createdAt])
+  @@index([hasStockIssue])
+  @@map("picking_waves")
+}
+
+model CargoCompany {
+  id        String   @id @default(uuid())
+  name      String
+  code      String
+  apiUrl    String?
+  apiKey    String?
+  apiSecret String?
+  isActive  Boolean  @default(true)
+  companyId String?
+  settings  Json?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  company   Company? @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  orders    Order[]
+
+  @@unique([companyId, code])
+  @@index([companyId])
+  @@index([isActive])
+  @@map("cargo_companies")
+}
+
+model AuditLog {
+  id         String   @id @default(uuid())
+  action     String
+  resource   String
+  resourceId String?
+  userId     String
+  companyId  String
+  details    Json?
+  ipAddress  String?
+  userAgent  String?
+  createdAt  DateTime @default(now())
+
+  @@index([companyId])
+  @@index([userId])
+  @@index([resource])
+  @@index([action])
+  @@index([createdAt])
+  @@map("audit_logs")
+}
+
+model CampaignSet {
+  id          String            @id @default(uuid())
+  name        String
+  sku         String
+  description String?
+  price       Decimal           @db.Decimal(10, 2)
+  isActive    Boolean           @default(true)
+  companyId   String
+  createdAt   DateTime          @default(now())
+  updatedAt   DateTime          @updatedAt
+  items       CampaignSetItem[]
+  company     Company           @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  stocks      CampaignStock[]
+  products    Product[]
+
+  @@unique([companyId, sku])
+  @@index([companyId])
+  @@index([isActive])
+  @@map("campaign_sets")
+}
+
+model CampaignSetItem {
+  id            String          @id @default(uuid())
+  campaignSetId String
+  productId     String
+  variantId     String?
+  quantity      Int
+  createdAt     DateTime        @default(now())
+  updatedAt     DateTime        @updatedAt
+  campaignSet   CampaignSet     @relation(fields: [campaignSetId], references: [id], onDelete: Cascade)
+  product       Product         @relation(fields: [productId], references: [id], onDelete: Cascade)
+  variant       ProductVariant? @relation(fields: [variantId], references: [id], onDelete: Cascade)
+
+  @@unique([campaignSetId, productId, variantId])
+  @@index([campaignSetId])
+  @@index([productId])
+  @@map("campaign_set_items")
+}
+
+model CampaignStock {
+  id            String      @id @default(uuid())
+  campaignSetId String
+  warehouseId   String
+  locationId    String?
+  quantity      Int         @default(0)
+  reservedQty   Int         @default(0)
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+  campaignSet   CampaignSet @relation(fields: [campaignSetId], references: [id], onDelete: Cascade)
+  location      Location?   @relation(fields: [locationId], references: [id])
+  warehouse     Warehouse   @relation(fields: [warehouseId], references: [id], onDelete: Cascade)
+
+  @@unique([campaignSetId, warehouseId, locationId], name: "campaignSetId_warehouseId_locationId")
+  @@index([campaignSetId])
+  @@index([warehouseId])
+  @@index([locationId])
+  @@map("campaign_stocks")
+}
+
+model ProductSetItem {
+  id                 String   @id @default(uuid())
+  setProductId       String
+  componentSku       String
+  componentProductId String
+  quantity           Int
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+  componentProduct   Product  @relation("ComponentProduct", fields: [componentProductId], references: [id], onDelete: Cascade)
+  setProduct         Product  @relation("SetProduct", fields: [setProductId], references: [id], onDelete: Cascade)
+
+  @@unique([setProductId, componentProductId])
+  @@index([setProductId])
+  @@index([componentProductId])
+  @@index([componentSku])
+  @@map("product_set_items")
+}
+
+model SetStock {
+  id           String    @id @default(uuid())
+  setProductId String
+  warehouseId  String
+  locationId   String?
+  quantity     Int       @default(0)
+  reservedQty  Int       @default(0)
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+  location     Location? @relation(fields: [locationId], references: [id])
+  setProduct   Product   @relation(fields: [setProductId], references: [id], onDelete: Cascade)
+  warehouse    Warehouse @relation(fields: [warehouseId], references: [id], onDelete: Cascade)
+
+  @@unique([setProductId, warehouseId, locationId])
+  @@index([setProductId])
+  @@index([warehouseId])
+  @@index([locationId])
+  @@map("set_stocks")
+}
+
+model JobLock {
+  id        String   @id @default(uuid())
+  jobName   String   @unique
+  lockedAt  DateTime @default(now())
+  expiresAt DateTime
+  lockedBy  String?
+  metadata  Json?
+  createdAt DateTime @default(now())
+
+  @@index([jobName])
+  @@index([expiresAt])
+  @@map("job_locks")
+}
+
+model Transfer {
+  id              String         @id @default(uuid())
+  code            String         @unique
+  fromWarehouseId String
+  toWarehouseId   String
+  status          TransferStatus @default(PENDING)
+  notes           String?
+  createdById     String
+  approvedById    String?
+  completedById   String?
+  companyId       String
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+  approvedAt      DateTime?
+  shippedAt       DateTime?
+  completedAt     DateTime?
+  items           TransferItem[]
+  fromWarehouse   Warehouse      @relation("TransferFrom", fields: [fromWarehouseId], references: [id])
+  toWarehouse     Warehouse      @relation("TransferTo", fields: [toWarehouseId], references: [id])
+
+  @@index([companyId])
+  @@index([companyId, status])
+  @@index([fromWarehouseId])
+  @@index([toWarehouseId])
+  @@index([status])
+  @@index([createdAt])
+  @@map("transfers")
+}
+
+model TransferItem {
+  id         String   @id @default(uuid())
+  transferId String
+  productId  String
+  variantId  String?
+  quantity   Int
+  notes      String?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+  transfer   Transfer @relation(fields: [transferId], references: [id], onDelete: Cascade)
+
+  @@index([transferId])
+  @@index([productId])
+  @@map("transfer_items")
+}
+
+model BulkOperation {
+  id             String    @id @default(uuid())
+  companyId      String
+  operationType  String // PRICE_INCREASE, PRICE_DECREASE, STOCK_UPDATE, BOTH
+  value          Decimal   @db.Decimal(10, 2)
+  valueType      String // PERCENTAGE, FIXED
+  status         String    @default("PENDING") // PENDING, PROCESSING, COMPLETED, FAILED
+  totalItems     Int
+  processedItems Int       @default(0)
+  failedItems    Int       @default(0)
+  marketplaces   Json? // Hangi pazaryerlerine uygulandı
+  createdAt      DateTime  @default(now())
+  completedAt    DateTime?
+  error          String?
+  company        Company   @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@index([companyId])
+  @@index([status])
+  @@index([createdAt])
+  @@map("bulk_operations")
+}
+
+enum UserRole {
+  SUPER_ADMIN
+  ADMIN
+  STAFF
+}
+
+enum CompanyStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  SUSPENDED
+}
+
+enum OrderStatus {
+  // Yeni sipariş durumları (Wave sistemi için)
+  NEW // Yeni sipariş (ödeme bekleniyor)
+  PAID // Ödeme tamamlandı
+  READY_TO_PICK // Wave için hazır
+  PICKED // Wave'den toplandı
+  PACKED // Paketlendi
+  SHIPPED // Gönderildi
+  DELIVERED // Teslim edildi
+  CANCELLED // İptal edildi
+  RETURNED // İade edildi
+  // PRODUCT RESOLUTION STATE
+  PENDING_RESOLUTION // Order has unresolved products (productId = NULL in OrderItems)
+  // Backward compatibility (eski sistem)
+  PENDING // Eski sistem (READY_TO_PICK ile eşdeğer)
+  PROCESSING // Eski sistem (PACKED ile eşdeğer)
+  // WooCommerce durumları (birebir aynı)
+  WC_PENDING // WooCommerce: pending - Ödeme bekleniyor
+  WC_PROCESSING // WooCommerce: processing - Hazırlanıyor
+  WC_ON_HOLD // WooCommerce: on-hold - Beklemede
+  WC_COMPLETED // WooCommerce: completed - Tamamlandı
+  WC_CANCELLED // WooCommerce: cancelled - İptal edildi
+  WC_REFUNDED // WooCommerce: refunded - İade edildi
+  WC_FAILED // WooCommerce: failed - Başarısız
+  WC_SHIPPED // WooCommerce: shipped - Kargoya verildi (plugin)
+  WC_DELIVERED // WooCommerce: delivered - Teslim edildi (plugin)
+  WC_TRASH // WooCommerce: trash - Silinmiş
+}
+
+enum ProductType {
+  PRODUCT
+  SET
+}
+
+enum StockLogType {
+  IN
+  OUT
+  RETURN
+  IN_CANCEL  // Order cancellation (stock returned before shipping)
+  IN_RETURN  // Order return (stock returned after shipping)
+  ADJUSTMENT
+  TRANSFER
+  OUT_SET_READY
+  OUT_SET_COMPONENT
+  PACKING_IN
+  RETURN_SET_READY
+  RETURN_SET_COMPONENT
+}
+
+enum MarketplaceType {
+  WOOCOMMERCE
+  TRENDYOL
+  HEPSIBURADA
+  N11
+  PAZARAMA
+  AMAZON
+  SHOPIFY
+  IKAS
+}
+
+enum IntegrationStatus {
+  ACTIVE
+  INACTIVE
+  ERROR
+}
+
+enum CountingStatus {
+  PENDING
+  IN_PROGRESS
+  COMPLETED
+  APPROVED
+  REJECTED
+}
+
+enum PickingStrategy {
+  SINGLE_ORDER
+  WAVE
+  BATCH
+  ZONE
+}
+
+enum WaveType {
+  TIME_BASED // Morning/Afternoon waves based on cut-off time
+  SKU_BASED // Orders with same SKU grouped together
+  PRIORITY // Express/same-day shipping, SLA-driven
+  MANUAL // Admin manually selected orders
+  MARKETPLACE // Grouped by marketplace
+  SHIPPING // Grouped by shipping method/carrier
+  COUNTRY // Grouped by destination country
+  MIXED // Multiple rules combined
+}
+
+enum WaveStatus {
+  // Eski status'ler (backward compatibility)
+  PENDING
+  IN_PROGRESS
+  COMPLETED
+  // Yeni status'ler
+  CREATED // Wave created, orders assigned
+  PICKING // Currently being picked
+  PACKING // Picked, being packed
+  SHIPPED // All orders shipped
+  CLOSED // Wave completed and closed
+  CANCELLED // Wave cancelled
+  EXCEPTION // Stock or other exception occurred
+}
+
+enum LocationType {
+  DEDICATED
+  SHARED
+}
+
+enum TransferStatus {
+  PENDING
+  IN_TRANSIT
+  COMPLETED
+  CANCELLED
+}
+
+enum MergeEntityType {
+  ORDER_ITEM
+  STOCK_LOG
+  MARKETPLACE_LINK
+  CAMPAIGN_SET_REFERENCE
+}
+
+model ProductMergeReference {
+  id               String          @id @default(uuid())
+  mergeId          String          // Unique identifier for this merge operation
+  companyId        String
+  entityType       MergeEntityType
+  entityId         String          // ID of the entity being re-linked (OrderItem.id, StockLog.id, etc.)
+  fromProductId    String          // Original product ID before merge
+  toProductId      String          // Master product ID after merge
+  createdAt        DateTime        @default(now())
+  
+  @@index([mergeId])
+  @@index([entityType, entityId])
+  @@index([fromProductId])
+  @@index([toProductId])
+  @@index([companyId])
+  @@map("product_merge_references")
+}
