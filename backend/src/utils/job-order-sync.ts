@@ -5,7 +5,7 @@ import { productRepository } from '../repositories/product.repository.js';
 import { warehouseRepository } from '../repositories/warehouse.repository.js';
 import { generateOrderNumber } from './helpers.js';
 import { logger } from './logger.js';
-import { MarketplaceType, StockLogType, OrderStatus } from '@prisma/client';
+import { MarketplaceType, StockLogType, OrderStatus, OrderIngestionStatus, Prisma } from '@prisma/client';
 import { runJobWithRetry, circuitBreaker } from './job-wrapper.js';
 import { createMiddleware } from './integration-middleware.js';
 import { ensureProductStockInWarehouse } from './stock-helper.js';
@@ -1321,6 +1321,19 @@ export async function syncIntegrationOrders(integration: any): Promise<void> {
         }
       }
 
+      // ✅ İPTAL EDİLMİŞ SİPARİŞLERİ FİLTRELE: İptal edilmiş siparişler yeni olarak oluşturulmamalı
+      const mappedStatus = mapMarketplaceStatusToOrderStatus(orderData.status, integration.type);
+      if (mappedStatus && isCancelledOrRefundedStatus(mappedStatus)) {
+        logger.info(`[${integration.type}] ⏭️ İptal edilmiş sipariş atlandı (yeni sipariş oluşturulmayacak): ${orderData.orderNumber}`, {
+          marketplaceOrderId: orderData.marketplaceOrderId,
+          apiStatus: orderData.status,
+          mappedStatus: mappedStatus,
+          reason: 'İptal edilmiş siparişler yeni olarak oluşturulmaz, sadece mevcut siparişlerin durumu güncellenir',
+        });
+        // İptal edilmiş siparişleri atla - yeni sipariş oluşturma
+        continue;
+      }
+
       // Log if no items found after processing
       if (orderItems.length === 0) {
         logger.warn(`[${integration.type}] Sipariş ${orderData.orderNumber} için hiç item işlenemedi`, {
@@ -1345,7 +1358,7 @@ export async function syncIntegrationOrders(integration: any): Promise<void> {
       // If any items are unresolved, order status should be NEW (yeni sipariş, henüz işlenemez)
       // Note: PENDING_RESOLUTION enum value will be added in future schema migration
       // For now, using NEW for unresolved items (yeni sipariş, çözülmesi gereken ürünler var)
-      const mappedStatus = mapMarketplaceStatusToOrderStatus(orderData.status, integration.type);
+      // mappedStatus zaten yukarıda hesaplandı
       const orderStatus = hasUnresolvedItems ? 'NEW' : (mappedStatus || 'NEW');
       
       // ✅ DEBUG: Yeni sipariş durumunu logla
@@ -1377,7 +1390,118 @@ export async function syncIntegrationOrders(integration: any): Promise<void> {
       }
       
       let createdOrderId: string | undefined;
-      const orderResult = await prisma.$transaction(async (tx) => {
+      let ingestionId: string | undefined;
+      const marketplace = integration.type as MarketplaceType;
+      const externalOrderId = orderData.marketplaceOrderId;
+      
+      if (!externalOrderId) {
+        throw new Error(`External order ID is required for idempotency check: ${orderData.orderNumber}`);
+      }
+      
+      try {
+        const orderResult = await prisma.$transaction(async (tx) => {
+        // ✅ IDEMPOTENCY LAYER: Check OrderIngestion INSIDE transaction
+        
+        if (!externalOrderId) {
+          throw new Error(`External order ID is required for idempotency check: ${orderData.orderNumber}`);
+        }
+
+        // STEP 1: Check for COMPLETED OrderIngestion (idempotent replay)
+        const completedIngestion = await tx.orderIngestion.findUnique({
+          where: {
+            companyId_marketplace_externalOrderId_status: {
+              companyId: integration.companyId,
+              marketplace,
+              externalOrderId,
+              status: OrderIngestionStatus.COMPLETED,
+            },
+          },
+        });
+
+        if (completedIngestion && completedIngestion.internalOrderId) {
+          logger.info(`[${integration.type}] ✅ Idempotent replay: Sipariş zaten işlenmiş: ${orderData.orderNumber}`, {
+            marketplaceOrderId: externalOrderId,
+            internalOrderId: completedIngestion.internalOrderId,
+            completedAt: completedIngestion.completedAt,
+          });
+          
+          // Return existing order (idempotent replay)
+          const existingOrder = await tx.order.findUnique({
+            where: { id: completedIngestion.internalOrderId },
+            include: { items: true },
+          });
+          
+          if (existingOrder) {
+            return existingOrder;
+          } else {
+            // Order was deleted but ingestion record exists - this is a data inconsistency
+            logger.error(`[${integration.type}] ⚠️ Data inconsistency: OrderIngestion points to non-existent order`, {
+              ingestionId: completedIngestion.id,
+              internalOrderId: completedIngestion.internalOrderId,
+            });
+            throw new Error(`Order ${completedIngestion.internalOrderId} not found but ingestion record exists`);
+          }
+        }
+
+        // STEP 2: Check for PROCESSING OrderIngestion (concurrent request)
+        const processingIngestion = await tx.orderIngestion.findUnique({
+          where: {
+            companyId_marketplace_externalOrderId_status: {
+              companyId: integration.companyId,
+              marketplace,
+              externalOrderId,
+              status: OrderIngestionStatus.PROCESSING,
+            },
+          },
+        });
+
+        if (processingIngestion) {
+          logger.warn(`[${integration.type}] ⚠️ Concurrent request detected: Sipariş başka bir worker tarafından işleniyor: ${orderData.orderNumber}`, {
+            marketplaceOrderId: externalOrderId,
+            ingestionId: processingIngestion.id,
+            attempt: processingIngestion.attempt,
+            createdAt: processingIngestion.createdAt,
+          });
+          throw new Error(`Order ingestion already in progress for ${externalOrderId}. Please retry later.`);
+        }
+
+        // STEP 3: Calculate attempt number (for retries after FAILED)
+        const maxAttempt = await tx.orderIngestion.findFirst({
+          where: {
+            companyId: integration.companyId,
+            marketplace,
+            externalOrderId,
+          },
+          orderBy: {
+            attempt: 'desc',
+          },
+          select: {
+            attempt: true,
+          },
+        });
+
+        const attempt = (maxAttempt?.attempt || 0) + 1;
+
+        // STEP 4: Create OrderIngestion record (status = PROCESSING)
+        const ingestion = await tx.orderIngestion.create({
+          data: {
+            companyId: integration.companyId,
+            marketplace,
+            externalOrderId,
+            status: OrderIngestionStatus.PROCESSING,
+            attempt,
+          },
+        });
+
+        ingestionId = ingestion.id; // Store for error handling
+
+        logger.info(`[${integration.type}] 🔄 OrderIngestion oluşturuldu (PROCESSING): ${orderData.orderNumber}`, {
+          ingestionId: ingestion.id,
+          attempt,
+          marketplaceOrderId: externalOrderId,
+        });
+
+        // STEP 5: Create Order (with all items)
         const order = await tx.order.create({
           data: {
             orderNumber: orderData.orderNumber || generateOrderNumber(), // Use WooCommerce order number if available
@@ -1589,9 +1713,57 @@ export async function syncIntegrationOrders(integration: any): Promise<void> {
         // ✅ STOK DÜŞÜŞÜ KALDIRILDI: Stok düşüşü artık sipariş oluşturulduktan sonra durum kontrolü ile yapılıyor
         // Transaction içinde stok düşüşü yapılmıyor - sipariş oluşturulduktan sonra deductOrderStock() çağrılıyor
         // Sadece "hazırlanıyor" durumunda (PROCESSING, WC_PROCESSING, PAID) stok düşecek
+
+        // STEP 7: Update OrderIngestion to COMPLETED
+        await tx.orderIngestion.update({
+          where: { id: ingestion.id },
+          data: {
+            status: OrderIngestionStatus.COMPLETED,
+            internalOrderId: order.id,
+            completedAt: new Date(),
+          },
+        });
+
+        logger.info(`[${integration.type}] ✅ OrderIngestion tamamlandı (COMPLETED): ${orderData.orderNumber}`, {
+          ingestionId: ingestion.id,
+          internalOrderId: order.id,
+          attempt,
+        });
         
         createdOrderId = order.id;
+        return order;
+      }, {
+        isolationLevel: Prisma.TransactionIsolationLevel.Serializable,
       });
+      } catch (transactionError: any) {
+        // ✅ ERROR HANDLING: Mark OrderIngestion as FAILED if transaction fails
+        if (ingestionId) {
+          try {
+            await prisma.orderIngestion.update({
+              where: { id: ingestionId },
+              data: {
+                status: OrderIngestionStatus.FAILED,
+                errorMessage: transactionError?.message || String(transactionError),
+              },
+            });
+            logger.error(`[${integration.type}] ❌ OrderIngestion FAILED olarak işaretlendi: ${orderData.orderNumber}`, {
+              ingestionId,
+              error: transactionError?.message || String(transactionError),
+              marketplaceOrderId: externalOrderId,
+            });
+          } catch (updateError) {
+            // If we can't update, log but don't fail - transaction already rolled back
+            logger.error(`[${integration.type}] ⚠️ OrderIngestion FAILED güncellenemedi: ${orderData.orderNumber}`, {
+              ingestionId,
+              updateError: updateError instanceof Error ? updateError.message : String(updateError),
+              originalError: transactionError?.message || String(transactionError),
+            });
+          }
+        }
+        
+        // Re-throw the original error
+        throw transactionError;
+      }
 
       // ✅ YENİ: Sipariş oluşturulduktan sonra durum kontrolü yap ve stok düşüşü yap
       // Sadece "hazırlanıyor" durumunda stok düş

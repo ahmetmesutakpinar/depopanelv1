@@ -145,6 +145,12 @@ export async function syncIntegrationProducts(integration: any): Promise<void> {
     
     logger.info(`[${integration.type}] ${products.length} ürün bulundu, işleniyor...`);
 
+    // ✅ FIX: Separate parent products and variations to ensure parents are processed first
+    const parentProducts = products.filter(p => !p.parentId);
+    const variations = products.filter(p => p.parentId);
+    
+    logger.info(`[${integration.type}] Ürün dağılımı: ${parentProducts.length} ana ürün, ${variations.length} varyasyon`);
+
     let processed = 0;
     let failed = 0;
     let created = 0;
@@ -162,7 +168,8 @@ export async function syncIntegrationProducts(integration: any): Promise<void> {
     
     logger.info(`[${integration.type}] Varsayılan depo kullanılıyor: ${defaultWarehouse.name} (${defaultWarehouse.code})`);
 
-    for (const productData of products) {
+    // ✅ FIX: Process parent products first
+    for (const productData of parentProducts) {
       try {
         // ✅ DÜZELTME: Use unified product matcher
         const { matchMarketplaceProduct, upsertProductSource } = await import('./product-matcher.js');
@@ -776,6 +783,169 @@ export async function syncIntegrationProducts(integration: any): Promise<void> {
         processed++;
       } catch (error) {
         logger.error(`[${integration.type}] Ürün işleme hatası: ${productData.sku}`, error);
+        failed++;
+      }
+    }
+
+    // ✅ FIX: Process variations AFTER all parent products are processed
+    logger.info(`[${integration.type}] Varyasyonlar işleniyor: ${variations.length} varyasyon...`);
+    for (const productData of variations) {
+      try {
+        // ✅ DÜZELTME: Use unified product matcher
+        const { matchMarketplaceProduct, upsertProductSource } = await import('./product-matcher.js');
+
+        if (!productData.marketplaceId) {
+          logger.warn(`[${integration.type}] Varyasyon marketplaceId yok, atlanıyor: ${productData.sku}`);
+          failed++;
+          continue;
+        }
+
+        // ✅ DEBUG: Log variation data received from WooCommerce
+        logger.info(`[${integration.type}] 🔍 Varyasyon verisi alındı: ${productData.sku}`, {
+          marketplaceId: productData.marketplaceId,
+          parentId: productData.parentId,
+          stock: productData.stock,
+          price: productData.price,
+          barcode: productData.barcode,
+          gtin: productData.gtin,
+          name: productData.name,
+        });
+
+        // Bu bir varyasyon - ProductVariant olarak kaydet
+        const parentProduct = await prisma.product.findFirst({
+          where: {
+            companyId: integration.companyId,
+            wooCommerceId: parseInt(productData.parentId!),
+          },
+        });
+
+        if (!parentProduct) {
+          logger.warn(`[${integration.type}] ⚠️ Parent ürün bulunamadı: ${productData.parentId}, varyasyon atlandı: ${productData.sku}`);
+          failed++;
+          continue;
+        }
+
+        // Varyasyonu oluştur veya güncelle
+        const variant = await prisma.productVariant.upsert({
+          where: {
+            productId_sku: {
+              productId: parentProduct.id,
+              sku: productData.sku,
+            },
+          },
+          create: {
+            productId: parentProduct.id,
+            sku: productData.sku,
+            barcode: (productData.barcode && productData.barcode.trim() !== '') ? productData.barcode.trim() : null,
+            name: productData.name,
+            attributes: productData.attributes || [],
+            price: productData.price,
+            imageUrl: productData.imageUrl || null,
+            isActive: true,
+          },
+          update: {
+            name: productData.name,
+            barcode: (productData.barcode && productData.barcode.trim() !== '') ? productData.barcode.trim() : null,
+            attributes: productData.attributes || [],
+            price: productData.price,
+            imageUrl: productData.imageUrl || null,
+          },
+        });
+
+        logger.info(`[${integration.type}] ✅ Varyasyon kaydedildi: ${productData.sku}`, {
+          variantId: variant.id,
+          barcode: variant.barcode,
+          price: variant.price,
+          parentSku: parentProduct.sku,
+        });
+
+        // Varyasyon stokunu güncelle
+        if (productData.stock !== undefined && productData.stock !== null) {
+          const marketplaceStockQty = Math.max(0, Math.floor(productData.stock));
+          
+          // Varyasyon için stok kaydını kontrol et
+          let variantStock = await prisma.stock.findFirst({
+            where: {
+              productId: parentProduct.id,
+              variantId: variant.id,
+              warehouseId: defaultWarehouse.id,
+            },
+          });
+
+          if (variantStock) {
+            // Mevcut stok ile karşılaştır
+            if (variantStock.quantity !== marketplaceStockQty) {
+              await updateProductStock({
+                productId: parentProduct.id,
+                warehouseId: defaultWarehouse.id,
+                variantId: variant.id,
+                quantity: marketplaceStockQty,
+                note: `Marketplace sync: ${integration.type}`,
+              });
+              stocksUpdated++;
+              logger.info(`[${integration.type}] ✅ Varyasyon stok güncellendi: ${productData.sku} (${variantStock.quantity} → ${marketplaceStockQty})`);
+            } else {
+              logger.debug(`[${integration.type}] Varyasyon stok aynı - Ürün: ${productData.sku}, Stok: ${marketplaceStockQty} (güncelleme atlandı)`);
+            }
+          } else {
+            // Yeni stok kaydı oluştur
+            await createProductStock({
+              productId: parentProduct.id,
+              warehouseId: defaultWarehouse.id,
+              variantId: variant.id,
+              quantity: marketplaceStockQty,
+              note: `Marketplace sync: ${integration.type}`,
+            });
+            stocksUpdated++;
+            logger.info(`[${integration.type}] ✅ Varyasyon stok oluşturuldu: ${productData.sku} (${marketplaceStockQty})`);
+          }
+        } else {
+          logger.warn(`[${integration.type}] ⚠️ Varyasyon stok bilgisi yok: ${productData.sku}`);
+        }
+
+        // ProductSource oluştur/güncelle (varyasyon için)
+        if (productData.marketplaceId) {
+          await prisma.productSource.upsert({
+            where: {
+              productId_integrationId: {
+                productId: parentProduct.id,
+                integrationId: integration.id,
+              },
+            },
+            create: {
+              productId: parentProduct.id,
+              integrationId: integration.id,
+              externalProductId: String(productData.marketplaceId),
+              externalSku: productData.sku || null,
+              externalBarcode: productData.barcode || null,
+              externalPrice: productData.price || null,
+              lastSyncAt: new Date(),
+            },
+            update: {
+              externalProductId: String(productData.marketplaceId),
+              externalSku: productData.sku || null,
+              externalBarcode: productData.barcode || null,
+              externalPrice: productData.price || null,
+              lastSyncAt: new Date(),
+            },
+          });
+        }
+
+        processed++;
+        logger.info(`[${integration.type}] ✅ Varyasyon tamamlandı: ${productData.sku} (Parent: ${parentProduct.sku})`);
+      } catch (error: any) {
+        logger.error(`[${integration.type}] ❌ Varyasyon işleme hatası: ${productData.sku}`, {
+          error: error?.message || String(error),
+          stack: error?.stack,
+          productData: {
+            sku: productData.sku,
+            marketplaceId: productData.marketplaceId,
+            parentId: productData.parentId,
+            stock: productData.stock,
+            price: productData.price,
+            barcode: productData.barcode,
+          },
+        });
         failed++;
       }
     }

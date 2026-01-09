@@ -90,6 +90,8 @@ function ProductsTab() {
   const [editingProduct, setEditingProduct] = useState<Product | null>(null);
   const [search, setSearch] = useState('');
   const [page, setPage] = useState(1);
+  const [sortBy, setSortBy] = useState<string>('createdAt');
+  const [sortOrder, setSortOrder] = useState<'asc' | 'desc'>('desc');
   const [selectedProducts, setSelectedProducts] = useState<string[]>([]);
   const [filterValues, setFilterValues] = useState<Record<string, any>>({});
   const [deleteModalOpen, setDeleteModalOpen] = useState(false);
@@ -106,8 +108,8 @@ function ProductsTab() {
   // NO filtering by marketplace link status, productId, or order linkage
   // WooCommerce is PRODUCT MASTER - all Woo products must be visible
   const { data: productsData, isLoading } = useQuery({
-    queryKey: ['products', page, search],
-    queryFn: () => api.getProducts({ page, limit: 20, search }),
+    queryKey: ['products', page, search, sortBy, sortOrder],
+    queryFn: () => api.getProducts({ page, limit: 20, search, sortBy, sortOrder }),
   });
 
   const { data: warehousesData } = useQuery({
@@ -346,6 +348,48 @@ function ProductsTab() {
                 leftIcon={<Search className="w-5 h-5" />}
                 value={search}
                 onChange={(e) => setSearch(e.target.value)}
+              />
+            </div>
+            {/* Sorting Dropdown */}
+            <div className="flex gap-2">
+              <Select
+                value={sortBy}
+                onChange={(e) => {
+                  setSortBy(e.target.value);
+                  setPage(1); // Reset to first page when sorting changes
+                }}
+                className="min-w-[150px]"
+                options={[
+                  { value: 'name', label: 'Ad' },
+                  { value: 'sku', label: 'SKU' },
+                  { value: 'price', label: 'Fiyat' },
+                  { value: 'stock', label: 'Stok' },
+                  { value: 'createdAt', label: 'Oluşturulma Tarihi' },
+                ]}
+              />
+              <Select
+                value={sortOrder}
+                onChange={(e) => {
+                  setSortOrder(e.target.value as 'asc' | 'desc');
+                  setPage(1); // Reset to first page when sort order changes
+                }}
+                className="min-w-[120px]"
+                options={
+                  sortBy === 'name' || sortBy === 'sku'
+                    ? [
+                        { value: 'asc', label: 'A-Z' },
+                        { value: 'desc', label: 'Z-A' },
+                      ]
+                    : sortBy === 'price' || sortBy === 'stock'
+                    ? [
+                        { value: 'asc', label: 'Düşük-Yüksek' },
+                        { value: 'desc', label: 'Yüksek-Düşük' },
+                      ]
+                    : [
+                        { value: 'desc', label: 'Yeni-Eski' },
+                        { value: 'asc', label: 'Eski-Yeni' },
+                      ]
+                }
               />
             </div>
             <AdvancedFilters

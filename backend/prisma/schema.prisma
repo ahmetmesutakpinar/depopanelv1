@@ -24,6 +24,7 @@ model Company {
   inventoryCounts InventoryCount[]
   integrations    MarketplaceIntegration[]
   orders          Order[]
+  orderIngestions OrderIngestion[]
   pickingWaves    PickingWave[]
   products        Product[]
   users           User[]
@@ -463,6 +464,7 @@ model Order {
   shippingProvider       String?
   items                  OrderItem[]
   orderSources           OrderSource[]
+  orderIngestion         OrderIngestion?
   cargoCompany           CargoCompany?           @relation(fields: [cargoCompanyId], references: [id])
   company                Company                 @relation(fields: [companyId], references: [id], onDelete: Cascade)
   createdBy              User?                   @relation("OrderCreatedBy", fields: [createdById], references: [id])
@@ -1109,6 +1111,12 @@ enum MergeEntityType {
   CAMPAIGN_SET_REFERENCE
 }
 
+enum OrderIngestionStatus {
+  PROCESSING
+  COMPLETED
+  FAILED
+}
+
 model ProductMergeReference {
   id               String          @id @default(uuid())
   mergeId          String          // Unique identifier for this merge operation
@@ -1125,4 +1133,25 @@ model ProductMergeReference {
   @@index([toProductId])
   @@index([companyId])
   @@map("product_merge_references")
+}
+
+model OrderIngestion {
+  id               String                @id @default(uuid())
+  companyId        String
+  marketplace      MarketplaceType
+  externalOrderId  String
+  internalOrderId  String?               @unique
+  status           OrderIngestionStatus
+  errorMessage     String?
+  attempt          Int                   @default(1)
+  createdAt        DateTime              @default(now())
+  completedAt      DateTime?
+  order            Order?                @relation(fields: [internalOrderId], references: [id], onDelete: SetNull)
+  company          Company               @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@index([companyId])
+  @@index([marketplace, externalOrderId])
+  // CRITICAL: multi-tenant safe uniqueness - only ONE COMPLETED ingestion per (companyId, marketplace, externalOrderId)
+  @@unique([companyId, marketplace, externalOrderId, status])
+  @@map("order_ingestions")
 }

@@ -283,16 +283,11 @@ export class ProductRepository {
       }),
     };
 
-    const orderBy: Prisma.ProductOrderByWithRelationInput = {
-      [options?.sortBy || 'createdAt']: options?.sortOrder || 'desc',
-    };
-
-    const [products, total] = await Promise.all([
-      prisma.product.findMany({
+    // Handle stock sorting with aggregation
+    if (options?.sortBy === 'stock') {
+      // Fetch all products matching criteria to calculate total stock
+      const allProducts = await prisma.product.findMany({
         where,
-        skip: options?.skip,
-        take: options?.take,
-        orderBy,
         include: {
           stocks: {
             include: {
@@ -317,9 +312,118 @@ export class ProductRepository {
             select: { id: true, name: true },
           },
         },
-      }),
-      prisma.product.count({ where }),
-    ]);
+      });
+
+      // Calculate total stock and sort
+      const productsWithTotalStock = allProducts.map(product => {
+        const totalStock = product.stocks.reduce((sum, stock) => sum + stock.quantity, 0);
+        return { ...product, totalStock };
+      });
+
+      const sortOrder = options?.sortOrder || 'desc';
+      
+      // Sort by total stock, with zero stock items at bottom
+      productsWithTotalStock.sort((a, b) => {
+        // Zero stock items always go to bottom
+        if (a.totalStock === 0 && b.totalStock > 0) return 1;
+        if (a.totalStock > 0 && b.totalStock === 0) return -1;
+        
+        // Sort by stock amount
+        if (sortOrder === 'desc') {
+          return b.totalStock - a.totalStock;
+        } else {
+          return a.totalStock - b.totalStock;
+        }
+      });
+
+      // Apply pagination
+      const total = productsWithTotalStock.length;
+      const skip = options?.skip || 0;
+      const take = options?.take || 20;
+      const paginatedProducts = productsWithTotalStock.slice(skip, skip + take);
+
+      // Remove totalStock from result
+      const products = paginatedProducts.map(({ totalStock, ...product }) => product) as ProductWithStock[];
+
+      return { products, total };
+    }
+
+    // For non-stock sorting, use normal Prisma query with secondary sort for zero stock
+    const sortBy = options?.sortBy || 'createdAt';
+    const sortOrder = options?.sortOrder || 'desc';
+    
+    // Fetch all products first to calculate total stock and sort
+    const allProducts = await prisma.product.findMany({
+      where,
+      include: {
+        stocks: {
+          include: {
+            warehouse: {
+              select: { id: true, name: true, code: true },
+            },
+            location: {
+              select: { id: true, code: true, name: true, zone: true, aisle: true, shelf: true, bin: true },
+            },
+          },
+        },
+        locationAssignments: {
+          where: { isPrimary: true },
+          include: {
+            location: {
+              select: { id: true, code: true, name: true, zone: true, aisle: true, shelf: true, bin: true, warehouseId: true },
+            },
+          },
+          take: 1,
+        },
+        category: {
+          select: { id: true, name: true },
+        },
+      },
+    });
+
+    // Calculate total stock for each product and sort
+    const productsWithTotalStock = allProducts.map(product => {
+      const totalStock = product.stocks.reduce((sum, stock) => sum + stock.quantity, 0);
+      return { ...product, totalStock };
+    });
+
+    // Sort by primary field, then by total stock (zero stock to bottom)
+    productsWithTotalStock.sort((a, b) => {
+      // Primary sort
+      let primaryComparison = 0;
+      if (sortBy === 'name') {
+        primaryComparison = a.name.localeCompare(b.name);
+      } else if (sortBy === 'sku') {
+        primaryComparison = a.sku.localeCompare(b.sku);
+      } else if (sortBy === 'price') {
+        primaryComparison = Number(a.price) - Number(b.price);
+      } else if (sortBy === 'createdAt') {
+        primaryComparison = a.createdAt.getTime() - b.createdAt.getTime();
+      }
+      
+      if (sortOrder === 'desc') {
+        primaryComparison = -primaryComparison;
+      }
+
+      // Secondary sort: zero stock items to bottom
+      if (primaryComparison === 0 || Math.abs(primaryComparison) < 0.001) {
+        // If primary sort is equal, sort by stock (zero stock to bottom)
+        if (a.totalStock === 0 && b.totalStock > 0) return 1;
+        if (a.totalStock > 0 && b.totalStock === 0) return -1;
+        return b.totalStock - a.totalStock; // Higher stock first among non-zero
+      }
+
+      return primaryComparison;
+    });
+
+    // Apply pagination
+    const total = productsWithTotalStock.length;
+    const skip = options?.skip || 0;
+    const take = options?.take || 20;
+    const paginatedProducts = productsWithTotalStock.slice(skip, skip + take);
+
+    // Remove totalStock from result (it's not part of ProductWithStock type)
+    const products = paginatedProducts.map(({ totalStock, ...product }) => product) as ProductWithStock[];
 
     return { products, total };
   }

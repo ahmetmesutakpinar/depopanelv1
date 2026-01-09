@@ -563,7 +563,8 @@ export class WooCommerceIntegration extends BaseMarketplaceIntegration {
                   option: attr.option || '',
                 })) : [];
 
-                products.push({
+                // ✅ DEBUG: Log variation data from WooCommerce API
+                const variationData = {
                   sku: v.sku || `${p.sku || p.id}-VAR-${variationId}`,
                   name: `${p.name} - ${variantAttributes.map((attr: any) => `${attr.name}: ${attr.option}`).join(', ') || 'Varyasyon'}`,
                   price: Number(v.regular_price || v.price || p.regular_price || 0),
@@ -575,7 +576,26 @@ export class WooCommerceIntegration extends BaseMarketplaceIntegration {
                   marketplaceId: String(v.id),
                   parentId: String(p.id), // ✅ YENİ: Parent ürün ID
                   attributes: variantAttributes, // ✅ YENİ: Varyasyon özellikleri
+                };
+
+                logger.info(`[WooCommerce] 🔍 Varyasyon verisi çekildi: ${variationData.sku}`, {
+                  variationId: v.id,
+                  parentId: p.id,
+                  stock_quantity: v.stock_quantity,
+                  regular_price: v.regular_price,
+                  price: v.price,
+                  barcode: v.barcode,
+                  gtin: v.gtin,
+                  hasAttributes: variantAttributes.length > 0,
+                  finalData: {
+                    stock: variationData.stock,
+                    price: variationData.price,
+                    barcode: variationData.barcode,
+                    gtin: variationData.gtin,
+                  },
                 });
+
+                products.push(variationData);
               } catch (error: any) {
                 logger.warn(`[WooCommerce] Varyasyon çekilemedi: ${variationId}`, {
                   error: error.message,

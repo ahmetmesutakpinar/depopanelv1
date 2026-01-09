@@ -6,7 +6,7 @@ import { warehouseRepository } from '../repositories/warehouse.repository.js';
 import { NotFoundError, AppError } from '../middleware/error.middleware.js';
 import { generateOrderNumber } from '../utils/helpers.js';
 import { logger } from '../utils/logger.js';
-import { OrderStatus, StockLogType } from '@prisma/client';
+import { OrderStatus, StockLogType, Prisma } from '@prisma/client';
 import { toNumber } from '../utils/decimal.js';
 
 interface CreateOrderInput {
@@ -85,7 +85,7 @@ class OrderService {
   }
 
   async createOrder(companyId: string, input: CreateOrderInput, userId?: string) {
-    // Get default warehouse if not specified
+    // Get default warehouse if not specified (outside transaction - this is safe)
     let warehouseId = input.warehouseId;
     if (!warehouseId) {
       const defaultWarehouse = await warehouseRepository.findDefaultByCompany(companyId);
@@ -95,45 +95,157 @@ class OrderService {
       warehouseId = defaultWarehouse.id;
     }
 
-    // Validate products and calculate totals
-    let subtotal = 0;
-    const orderItems: any[] = [];
-
-    for (const item of input.items) {
-      const product = await productRepository.findByIdAndCompany(item.productId, companyId);
-      if (!product) {
-        throw new NotFoundError(`Ürün bulunamadı: ${item.productId}`);
-      }
-
-      // Check stock
-      const stock = await stockRepository.findStock(item.productId, warehouseId, item.variantId);
-      const availableQty = (stock?.quantity || 0) - (stock?.reservedQty || 0);
-
-      if (availableQty < item.quantity) {
-        throw new AppError(`Yetersiz stok: ${product.name}. Mevcut: ${availableQty}, Talep: ${item.quantity}`, 400);
-      }
-
-      const itemTotal = Number(product.price) * item.quantity;
-      subtotal += itemTotal;
-
-      orderItems.push({
-        productId: item.productId,
-        variantId: item.variantId,
-        sku: product.sku,
-        name: product.name,
-        quantity: item.quantity,
-        unitPrice: toNumber(product.price),
-        taxRate: toNumber(product.taxRate),
-        discount: 0,
-        total: itemTotal,
-      });
-    }
-
-    const taxAmount = subtotal * 0.20; // Default 20% KDV
-    const total = subtotal + taxAmount;
-
-    // Create order with stock deduction (WooCommerce mantığı: sipariş oluşturulduğunda stok düşer)
+    // ALL operations inside single atomic transaction to prevent race conditions
     const order = await prisma.$transaction(async (tx) => {
+      // STEP 1: Validate products and check stock (INSIDE transaction)
+      let subtotal = 0;
+      const orderItems: any[] = [];
+      const stockValidations: Array<{
+        productId: string;
+        variantId?: string;
+        quantity: number;
+        product: any;
+        stock?: any;
+      }> = [];
+
+      for (const item of input.items) {
+        // Read product INSIDE transaction
+        const product = await tx.product.findUnique({
+          where: { id: item.productId },
+          include: {
+            campaignSet: {
+              include: {
+                items: {
+                  include: {
+                    product: {
+                      select: { id: true, sku: true, name: true },
+                    },
+                    variant: {
+                      select: { id: true, sku: true, name: true },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        });
+
+        if (!product) {
+          throw new NotFoundError(`Ürün bulunamadı: ${item.productId}`);
+        }
+
+        if (product.companyId !== companyId) {
+          throw new AppError(`Ürün bu şirkete ait değil: ${item.productId}`, 403);
+        }
+
+        // STEP 2: Read stock WITHIN transaction (prevents race condition)
+        // For normal products, check stock availability
+        if (!product.campaignSetId) {
+          // Find stock with location priority (same logic as before, but INSIDE transaction)
+          let stock: any = null;
+          
+          // Try primary location first
+          const primaryLocation = await tx.productLocationAssignment.findFirst({
+            where: {
+              productId: item.productId,
+              variantId: item.variantId || null,
+              isPrimary: true,
+            },
+            include: {
+              location: true,
+            },
+          });
+
+          if (primaryLocation && primaryLocation.location.warehouseId === warehouseId) {
+            stock = await tx.stock.findFirst({
+              where: {
+                productId: item.productId,
+                warehouseId: warehouseId!,
+                locationId: primaryLocation.locationId,
+                variantId: item.variantId || null,
+              },
+            });
+          }
+
+          // If no primary location stock, try any location-based stock
+          if (!stock) {
+            stock = await tx.stock.findFirst({
+              where: {
+                productId: item.productId,
+                warehouseId: warehouseId!,
+                locationId: { not: null },
+                variantId: item.variantId || null,
+              },
+              orderBy: {
+                quantity: 'desc',
+              },
+            });
+          }
+
+          // If no location stock, try warehouse-level stock
+          if (!stock) {
+            stock = await tx.stock.findFirst({
+              where: {
+                productId: item.productId,
+                warehouseId: warehouseId!,
+                locationId: null,
+                variantId: item.variantId || null,
+              },
+            });
+          }
+
+          if (!stock) {
+            throw new AppError(`Stok bulunamadı: ${product.name}`, 400);
+          }
+
+          // STEP 3: Validate stock availability (INSIDE transaction - prevents race condition)
+          const availableQty = stock.quantity - stock.reservedQty;
+          if (availableQty < item.quantity) {
+            throw new AppError(
+              `Yetersiz stok: ${product.name}. Mevcut: ${availableQty}, Talep: ${item.quantity}`,
+              400
+            );
+          }
+
+          // Store stock info for later deduction
+          stockValidations.push({
+            productId: item.productId,
+            variantId: item.variantId,
+            quantity: item.quantity,
+            product,
+            stock,
+          });
+        } else {
+          // Campaign SET - validate later in processCampaignSetItemForOrder
+          stockValidations.push({
+            productId: item.productId,
+            variantId: item.variantId,
+            quantity: item.quantity,
+            product,
+          });
+        }
+
+        // Calculate totals
+        const itemTotal = Number(product.price) * item.quantity;
+        subtotal += itemTotal;
+
+        orderItems.push({
+          productId: item.productId,
+          variantId: item.variantId,
+          sku: product.sku,
+          name: product.name,
+          quantity: item.quantity,
+          unitPrice: toNumber(product.price),
+          taxRate: toNumber(product.taxRate),
+          discount: 0,
+          total: itemTotal,
+        });
+      }
+
+      const taxAmount = subtotal * 0.20; // Default 20% KDV
+      const total = subtotal + taxAmount;
+
+      // STEP 4: Create order (INSIDE transaction)
       // Create order
       const newOrder = await tx.order.create({
         data: {
@@ -165,145 +277,46 @@ class OrderService {
         },
       });
 
-      // Deduct stock for each item when order is created (WooCommerce behavior)
-      for (const item of newOrder.items) {
-        if (!item.productId) {
-          // Try to find product by SKU
-          if (item.sku) {
-            const product = await tx.product.findFirst({
-              where: {
-                sku: item.sku,
-                companyId: companyId,
-              },
-            });
+      // STEP 5: Deduct stock and create logs (INSIDE transaction)
+      for (const validation of stockValidations) {
+        const { productId, variantId, quantity, product, stock } = validation;
 
-            if (product) {
-              // Update order item with productId
-              await tx.orderItem.update({
-                where: { id: item.id },
-                data: { productId: product.id },
-              });
-              // Update item reference
-              item.productId = product.id;
-            } else {
-              logger.warn(`[createOrder] Product bulunamadı: ${item.sku}, stok düşürme atlanıyor`);
-              continue;
-            }
-          } else {
-            logger.warn(`[createOrder] ProductId ve SKU bulunamadı, stok düşürme atlanıyor`);
-            continue;
-          }
-        }
-
-        // Get product to check if it's a Campaign SET
-        const product = await tx.product.findUnique({
-          where: { id: item.productId },
-          include: {
-            campaignSet: {
-              include: {
-                items: {
-                  include: {
-                    product: {
-                      select: { id: true, sku: true, name: true },
-                    },
-                    variant: {
-                      select: { id: true, sku: true, name: true },
-                    },
-                  },
-                },
-              },
-            },
-          },
-        });
-
-        if (!product) {
-          logger.warn(`[createOrder] Product bulunamadı: ${item.productId}, stok düşürme atlanıyor`);
-          continue;
-        }
-
-        // Check if product is a Campaign SET (using FK relation)
+        // Handle Campaign SET products
         if (product.campaignSetId && product.campaignSet) {
-          // Campaign SET picking algorithm
           await this.processCampaignSetItemForOrder(tx, {
             setProductId: product.id,
             campaignSetId: product.campaignSetId,
             setSku: product.sku,
-            quantity: item.quantity,
+            quantity,
             warehouseId: warehouseId!,
             orderNumber: newOrder.orderNumber,
             orderId: newOrder.id,
             userId,
             campaignSet: product.campaignSet,
           });
-        } else {
+        } else if (stock) {
           // Normal product stock deduction
-          // Find stock - prioritize location-based if available
-          const primaryLocation = await tx.productLocationAssignment.findFirst({
-            where: {
-              productId: item.productId,
-              variantId: item.variantId || null,
-              isPrimary: true,
-            },
-            include: {
-              location: true,
-            },
+          // STEP 6: Re-validate stock (double-check after order creation)
+          // This ensures no concurrent order modified stock between check and deduction
+          const currentStock = await tx.stock.findUnique({
+            where: { id: stock.id },
           });
 
-          let stock: any = null;
-          
-          // If primary location exists and belongs to this warehouse, use it
-          if (primaryLocation && primaryLocation.location.warehouseId === warehouseId) {
-            stock = await tx.stock.findFirst({
-              where: {
-                productId: item.productId,
-                warehouseId: warehouseId!,
-                locationId: primaryLocation.locationId,
-                variantId: item.variantId || null,
-              },
-            });
+          if (!currentStock) {
+            throw new AppError(`Stok kaydı bulunamadı: ${product.name}`, 400);
           }
 
-          // If no primary location stock, try any location-based stock in this warehouse
-          if (!stock) {
-            stock = await tx.stock.findFirst({
-              where: {
-                productId: item.productId,
-                warehouseId: warehouseId!,
-                locationId: { not: null },
-                variantId: item.variantId || null,
-              },
-              orderBy: {
-                quantity: 'desc',
-              },
-            });
+          const currentAvailableQty = currentStock.quantity - currentStock.reservedQty;
+          if (currentAvailableQty < quantity) {
+            throw new AppError(
+              `Yetersiz stok (eşzamanlı sipariş): ${product.name}. Mevcut: ${currentAvailableQty}, Talep: ${quantity}`,
+              400
+            );
           }
 
-          // If no location stock found, try warehouse-level stock
-          if (!stock) {
-            stock = await tx.stock.findFirst({
-              where: {
-                productId: item.productId,
-                warehouseId: warehouseId!,
-                locationId: null,
-                variantId: item.variantId || null,
-              },
-            });
-          }
-
-          if (!stock) {
-            logger.warn(`[createOrder] Stok bulunamadı: ${product.name}, stok düşürme atlanıyor`);
-            continue;
-          }
-
-          const availableQty = stock.quantity - stock.reservedQty;
-          if (availableQty < item.quantity) {
-            logger.warn(`[createOrder] Yetersiz stok: ${product.name}. Mevcut: ${availableQty}, Gerekli: ${item.quantity}, stok düşürme atlanıyor`);
-            continue;
-          }
-
-          // Update stock
-          const previousQty = stock.quantity;
-          const newQty = Math.max(0, previousQty - item.quantity);
+          // STEP 7: Deduct stock (INSIDE transaction)
+          const previousQty = currentStock.quantity;
+          const newQty = Math.max(0, previousQty - quantity);
 
           await tx.stock.update({
             where: { id: stock.id },
@@ -312,24 +325,26 @@ class OrderService {
             },
           });
 
-          // Create stock log with location info
-          const locationInfo = stock.locationId 
-            ? await tx.location.findUnique({ 
-                where: { id: stock.locationId },
-                select: { code: true }
-              }).then(loc => loc ? ` - Lokasyon: ${loc.code}` : '')
+          // STEP 8: Create stock log (INSIDE transaction)
+          const locationInfo = stock.locationId
+            ? await tx.location
+                .findUnique({
+                  where: { id: stock.locationId },
+                  select: { code: true },
+                })
+                .then((loc) => (loc ? ` - Lokasyon: ${loc.code}` : ''))
             : '';
-          
+
           await tx.stockLog.create({
             data: {
               type: 'OUT',
-              quantity: item.quantity,
+              quantity,
               previousQty,
               newQty,
               note: `Sipariş oluşturuldu: ${newOrder.orderNumber}${locationInfo}`,
               reference: newOrder.id,
-              productId: item.productId,
-              variantId: item.variantId || null,
+              productId,
+              variantId: variantId || null,
               warehouseId: warehouseId!,
               userId,
             },
@@ -338,6 +353,12 @@ class OrderService {
       }
 
       return newOrder;
+    }, {
+      // Use SERIALIZABLE isolation level for maximum safety
+      // This ensures no phantom reads or concurrent modifications
+      isolationLevel: Prisma.TransactionIsolationLevel.Serializable,
+      // Set timeout to prevent long-running transactions
+      timeout: 30000, // 30 seconds
     });
 
     return order;

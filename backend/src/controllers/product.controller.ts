@@ -57,7 +57,7 @@ export const updateProductSchema = z.object({
 const productQuerySchema = paginationSchema.extend({
   categoryId: z.string().uuid().optional(),
   isActive: z.enum(['true', 'false']).transform(v => v === 'true').optional(),
-  sortBy: z.enum(['name', 'sku', 'price', 'createdAt']).optional(),
+  sortBy: z.enum(['name', 'sku', 'price', 'stock', 'createdAt']).optional(),
 });
 
 // ==================== CONTROLLER ====================
